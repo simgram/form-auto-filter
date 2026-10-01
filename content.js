@@ -1,8 +1,10 @@
 (() => {
-  const TARGET_SELECTOR = 'input[type="text"], input[type="tel"], input[type="email"], textarea';
+  const TARGET_SELECTOR = 'input:not([type="password"]):not([type="hidden"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="image"]):not([type="file"]), textarea, select';
   const FIELD_MARK = "data-local-fill-host";
   const hosts = new Map();
   const statuses = new Map();
+  const userTouchedFields = new WeakSet();
+  const programmaticFields = new WeakSet();
   let styleText = "";
   let scanTimer;
 
@@ -48,9 +50,12 @@
   }
 
   function attach(field) {
-    if (!(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement)) return;
-    if (field.disabled || field.readOnly || field.type === "hidden" || field.hasAttribute(FIELD_MARK)) return;
+    if (!(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement || field instanceof HTMLSelectElement)) return;
+    if (field.disabled || field.readOnly || field.hasAttribute(FIELD_MARK)) return;
+    if (field instanceof HTMLInputElement && ["password", "hidden", "button", "submit", "reset", "image", "file"].includes(field.type)) return;
     field.setAttribute(FIELD_MARK, "");
+    field.addEventListener("input", () => { if (!programmaticFields.has(field)) userTouchedFields.add(field); });
+    field.addEventListener("change", () => { if (!programmaticFields.has(field)) userTouchedFields.add(field); });
     const host = document.createElement("div");
     host.className = "local-input-assistant-host";
     host.setAttribute("aria-label", "入力値を保存");
@@ -122,15 +127,41 @@
     const { savedItems = [] } = await chrome.storage.local.get(["savedItems"]);
     if (!Array.isArray(savedItems) || !savedItems.length) return;
     for (const field of fields) {
-      if (!field.isConnected || field.disabled || field.readOnly || field.value.trim()) continue;
+      if (!field.isConnected || field.disabled || field.readOnly || userTouchedFields.has(field)) continue;
+      const isCheckbox = field instanceof HTMLInputElement && field.type === "checkbox";
+      const isRadio = field instanceof HTMLInputElement && field.type === "radio";
+      const isSelect = field instanceof HTMLSelectElement;
+      const isTextLike = field instanceof HTMLTextAreaElement ||
+        (field instanceof HTMLInputElement && ["text", "search", "tel", "url", "email"].includes(field.type));
+      if (isTextLike && field.value.trim()) continue;
       const fieldLabels = fieldInfo(field).labels.map(normalize).filter((label) => label.length >= 2);
       const best = savedItems.find((item) =>
         item.siteKey === siteKey &&
         Boolean(item.value) &&
-        fieldLabels.includes(normalize(item.label || ""))
+        fieldLabels.includes(normalize(item.label || "")) &&
+        (!isRadio || item.value === field.value)
       );
-      if (best && field.isConnected && !field.value.trim()) {
-        setNativeValue(field, best.value);
+      if (best && field.isConnected && !userTouchedFields.has(field)) {
+        if (isCheckbox) {
+          if (String(field.checked) === String(best.value)) continue;
+          setFieldValue(field, best.value);
+        } else if (isRadio) {
+          if (field.checked) continue;
+          setFieldValue(field, true);
+        } else if (isSelect) {
+          const values = field.multiple ? parseMultiSelectValue(best.value) : [best.value];
+          if (field.multiple) {
+            const currentValues = Array.from(field.selectedOptions, (option) => option.value);
+            if (currentValues.length === values.length && values.every((value) => currentValues.includes(value))) continue;
+          }
+          if (!field.multiple && field.value === best.value) continue;
+          if (!values.every((value) => Array.from(field.options).some((option) => option.value === value))) continue;
+          setFieldValue(field, best.value);
+        } else if (field.value !== best.value) {
+          setFieldValue(field, best.value);
+        } else {
+          continue;
+        }
         const status = statuses.get(field);
         if (status) showStatus(status, `「${best.label}」を復元しました`);
       }
@@ -138,9 +169,24 @@
   }
 
   async function saveField(field, controls) {
-    const value = field.value.trim();
-    if (!value) return showStatus(controls, "値を入力してください", true);
-    const info = fieldInfo(field);
+    let sourceField = field;
+    const isRadio = field instanceof HTMLInputElement && field.type === "radio";
+    if (isRadio) {
+      const group = field.name
+        ? Array.from(document.querySelectorAll('input[type="radio"]')).filter((candidate) => candidate.name === field.name && candidate.form === field.form)
+        : [field];
+      sourceField = group.find((candidate) => candidate.checked);
+      if (!sourceField) return showStatus(controls, "ラジオボタンを選択してください", true);
+    }
+    const isCheckbox = sourceField instanceof HTMLInputElement && sourceField.type === "checkbox";
+    const isMultiSelect = sourceField instanceof HTMLSelectElement && sourceField.multiple;
+    const value = isCheckbox
+      ? String(sourceField.checked)
+      : isMultiSelect
+        ? JSON.stringify(Array.from(sourceField.selectedOptions, (option) => option.value))
+        : sourceField.value.trim();
+    if (!value) return showStatus(controls, "値を選択してください", true);
+    const info = fieldInfo(sourceField);
     const label = (info.labels[0] || field.placeholder || field.name || "保存項目").trim().slice(0, 100);
     const siteKey = currentSiteKey();
     const { savedItems = [] } = await chrome.storage.local.get(["savedItems"]);
@@ -157,13 +203,39 @@
     showStatus(controls, `「${label}」をこのページ用に保存しました`);
   }
 
-  function setNativeValue(field, value) {
-    const prototype = field instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
-    if (setter) setter.call(field, value);
-    else field.value = value;
+  function setFieldValue(field, value) {
+    programmaticFields.add(field);
+    if (field instanceof HTMLInputElement && (field.type === "checkbox" || field.type === "radio")) {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "checked")?.set;
+      const checked = field.type === "radio" ? value === true : value === true || value === "true";
+      if (setter) setter.call(field, checked);
+      else field.checked = checked;
+    } else if (field instanceof HTMLSelectElement && field.multiple) {
+      const values = parseMultiSelectValue(value);
+      const selected = new Set(values);
+      for (const option of field.options) option.selected = selected.has(option.value);
+    } else {
+      const prototype = field instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : field instanceof HTMLSelectElement
+          ? HTMLSelectElement.prototype
+          : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+      if (setter) setter.call(field, value);
+      else field.value = value;
+    }
     field.dispatchEvent(new Event("input", { bubbles: true }));
     field.dispatchEvent(new Event("change", { bubbles: true }));
+    programmaticFields.delete(field);
+  }
+
+  function parseMultiSelectValue(value) {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed.map(String) : [String(value)];
+    } catch {
+      return [String(value)];
+    }
   }
 
   function showStatus(target, text, error = false) {
