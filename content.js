@@ -3,6 +3,11 @@
   const FIELD_MARK = "data-local-fill-host";
   const hosts = new Map();
   const statuses = new Map();
+  const radioGroupRepresentatives = new Map();
+  const radioGroupsByOwner = new WeakMap();
+  const radioGroupKeysByField = new WeakMap();
+  const radioGroupMetadata = new WeakMap();
+  const trackedFields = new WeakSet();
   const userTouchedFields = new WeakSet();
   const programmaticFields = new WeakSet();
   let styleText = "";
@@ -53,9 +58,20 @@
     if (!(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement || field instanceof HTMLSelectElement)) return;
     if (field.disabled || field.readOnly || field.hasAttribute(FIELD_MARK)) return;
     if (field instanceof HTMLInputElement && ["password", "hidden", "button", "submit", "reset", "image", "file"].includes(field.type)) return;
+    if (!trackedFields.has(field)) {
+      field.addEventListener("input", () => { if (!programmaticFields.has(field)) userTouchedFields.add(field); });
+      field.addEventListener("change", () => { if (!programmaticFields.has(field)) userTouchedFields.add(field); });
+      field.addEventListener("change", positionAll);
+      trackedFields.add(field);
+    }
+    if (field instanceof HTMLInputElement && field.type === "radio") {
+      const groupKey = getRadioGroupKey(field);
+      const representative = radioGroupRepresentatives.get(groupKey);
+      if (representative?.isConnected) return;
+      if (representative) removeFieldHost(representative, false);
+      radioGroupRepresentatives.set(groupKey, field);
+    }
     field.setAttribute(FIELD_MARK, "");
-    field.addEventListener("input", () => { if (!programmaticFields.has(field)) userTouchedFields.add(field); });
-    field.addEventListener("change", () => { if (!programmaticFields.has(field)) userTouchedFields.add(field); });
     const host = document.createElement("div");
     host.className = "local-input-assistant-host";
     host.setAttribute("aria-label", "入力値を保存");
@@ -75,7 +91,10 @@
 
   function position(field, host) {
     if (!field.isConnected) return;
-    const rect = field.getBoundingClientRect();
+    const anchor = field instanceof HTMLInputElement && field.type === "radio"
+      ? getRadioGroupMembers(field).find((member) => member.checked) || field
+      : field;
+    const rect = anchor.getBoundingClientRect();
     host.style.left = `${Math.max(0, Math.min(window.innerWidth - 38, rect.right - 38))}px`;
     host.style.top = `${Math.max(0, Math.min(window.innerHeight - 34, rect.bottom - 34))}px`;
     host.hidden = rect.width === 0 || rect.height === 0;
@@ -84,14 +103,54 @@
   function positionAll() {
     for (const [field, host] of hosts) {
       if (!field.isConnected) {
-        host.remove();
-        hosts.delete(field);
-        statuses.delete(field);
-        field.removeAttribute(FIELD_MARK);
+        removeFieldHost(field);
       } else {
         position(field, host);
       }
     }
+  }
+
+  function removeFieldHost(field, chooseReplacement = true) {
+    hosts.get(field)?.remove();
+    hosts.delete(field);
+    statuses.delete(field);
+    field.removeAttribute(FIELD_MARK);
+    if (!(field instanceof HTMLInputElement) || field.type !== "radio") return;
+    const groupKey = getRadioGroupKey(field);
+    if (radioGroupRepresentatives.get(groupKey) !== field) return;
+    radioGroupRepresentatives.delete(groupKey);
+    if (chooseReplacement) {
+      const replacement = getRadioGroupMembers(field).find((member) => member.isConnected && !member.hasAttribute(FIELD_MARK));
+      if (replacement) attach(replacement);
+    }
+  }
+
+  function getRadioGroupKey(field) {
+    if (!field.name) return field;
+    const cached = radioGroupKeysByField.get(field);
+    if (cached) return cached;
+    const owner = field.form || field.getRootNode();
+    let groups = radioGroupsByOwner.get(owner);
+    if (!groups) {
+      groups = new Map();
+      radioGroupsByOwner.set(owner, groups);
+    }
+    if (!groups.has(field.name)) {
+      const key = {};
+      groups.set(field.name, key);
+      radioGroupMetadata.set(key, { owner, name: field.name });
+    }
+    const key = groups.get(field.name);
+    radioGroupKeysByField.set(field, key);
+    return key;
+  }
+
+  function getRadioGroupMembers(field) {
+    if (!field.name) return [field];
+    const metadata = radioGroupMetadata.get(getRadioGroupKey(field));
+    return Array.from(document.querySelectorAll('input[type="radio"]'))
+      .filter((candidate) => candidate.name === metadata.name &&
+        (metadata.owner instanceof HTMLFormElement ? candidate.form === metadata.owner : candidate.getRootNode() === metadata.owner));
   }
 
   function fieldInfo(field) {
@@ -172,9 +231,7 @@
     let sourceField = field;
     const isRadio = field instanceof HTMLInputElement && field.type === "radio";
     if (isRadio) {
-      const group = field.name
-        ? Array.from(document.querySelectorAll('input[type="radio"]')).filter((candidate) => candidate.name === field.name && candidate.form === field.form)
-        : [field];
+      const group = getRadioGroupMembers(field);
       sourceField = group.find((candidate) => candidate.checked);
       if (!sourceField) return showStatus(controls, "ラジオボタンを選択してください", true);
     }
