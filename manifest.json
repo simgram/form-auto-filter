@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "予約フォーム 入力アシスタント",
+  "version": "1.0.0",
+  "description": "Webフォームの入力値をローカルに保存し、次回表示時に復元します。",
+  "permissions": ["storage"],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["content.style.css"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "options_page": "options/options.html"
+}
